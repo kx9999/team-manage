@@ -12,6 +12,7 @@ from sqlalchemy import select, update, delete, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import AsyncSessionLocal
 
+from app.config import settings
 from app.models import RedemptionCode, RedemptionRecord, Team
 from app.services.redemption import RedemptionService
 from app.services.team import TeamService
@@ -38,6 +39,45 @@ class RedeemFlowService:
         self.team_service = TeamService()
         self.chatgpt_service = chatgpt_service
 
+    def _is_super_redeem_code(self, code: str) -> bool:
+        """
+        判断当前兑换码是否为 env 配置的特权兑换码
+        """
+        if not settings.super_redeem_code_enabled:
+            return False
+        super_code = (settings.super_redeem_code or "").strip()
+        if not super_code:
+            return False
+        if len(super_code) > 32:
+            logger.warning("SUPER_REDEEM_CODE 长度超过 32，已忽略该配置")
+            return False
+        return code == super_code
+
+    async def _ensure_super_code_record(
+        self,
+        code: str,
+        db_session: AsyncSession
+    ) -> None:
+        """
+        确保特权兑换码在 redemption_codes 表中有占位记录（用于外键约束和管理展示）
+        """
+        stmt = select(RedemptionCode).where(RedemptionCode.code == code)
+        result = await db_session.execute(stmt)
+        existing = result.scalar_one_or_none()
+        if existing:
+            return
+
+        db_session.add(
+            RedemptionCode(
+                code=code,
+                status="warranty_active",
+                expires_at=None,
+                has_warranty=True,
+                warranty_days=365000
+            )
+        )
+        logger.info("已创建特权兑换码占位记录")
+
     async def verify_code_and_get_teams(
         self,
         code: str,
@@ -48,6 +88,26 @@ class RedeemFlowService:
         针对 aiosqlite 进行优化，避免 greenlet_spawn 报错
         """
         try:
+            # 0. env 特权兑换码：直接视为有效（仍需有可用 Team）
+            if self._is_super_redeem_code(code):
+                teams_result = await self.team_service.get_available_teams(db_session)
+                if not teams_result["success"]:
+                    return {
+                        "success": False,
+                        "valid": True,
+                        "reason": "特权兑换码有效",
+                        "teams": [],
+                        "error": teams_result["error"]
+                    }
+                logger.info(f"特权兑换码验证通过，可用 Team 数量: {len(teams_result['teams'])}")
+                return {
+                    "success": True,
+                    "valid": True,
+                    "reason": "特权兑换码有效",
+                    "teams": teams_result["teams"],
+                    "error": None
+                }
+
             # 1. 验证兑换码
             validate_result = await self.redemption_service.validate_code(code, db_session)
 
@@ -175,6 +235,7 @@ class RedeemFlowService:
         core_success = False
         success_result = None
         team_id_final = None
+        is_super_code = self._is_super_redeem_code(code)
 
         # 针对 code 加锁，防止同一个码并发进入兑换
         async with _code_locks[code]:
@@ -209,26 +270,27 @@ class RedeemFlowService:
                             await db_session.begin()
                         
                         try:
-                            # 1. 验证和锁定码
-                            stmt = select(RedemptionCode).where(RedemptionCode.code == code).with_for_update()
-                            res = await db_session.execute(stmt)
-                            rc = res.scalar_one_or_none()
+                            # 1. 验证和锁定码（特权码跳过状态检查）
+                            if not is_super_code:
+                                stmt = select(RedemptionCode).where(RedemptionCode.code == code).with_for_update()
+                                res = await db_session.execute(stmt)
+                                rc = res.scalar_one_or_none()
 
-                            if not rc:
-                                await db_session.rollback()
-                                return {"success": False, "error": "兑换码不存在"}
-                            
-                            if rc.status not in ["unused", "warranty_active"]:
-                                if rc.status == "used":
-                                    warranty_check = await self.warranty_service.validate_warranty_reuse(
-                                        db_session, code, email
-                                    )
-                                    if not warranty_check.get("can_reuse"):
-                                        await db_session.rollback()
-                                        return {"success": False, "error": warranty_check.get("reason") or "兑换码已使用"}
-                                else:
+                                if not rc:
                                     await db_session.rollback()
-                                    return {"success": False, "error": f"兑换码状态无效: {rc.status}"}
+                                    return {"success": False, "error": "兑换码不存在"}
+                                
+                                if rc.status not in ["unused", "warranty_active"]:
+                                    if rc.status == "used":
+                                        warranty_check = await self.warranty_service.validate_warranty_reuse(
+                                            db_session, code, email
+                                        )
+                                        if not warranty_check.get("can_reuse"):
+                                            await db_session.rollback()
+                                            return {"success": False, "error": warranty_check.get("reason") or "兑换码已使用"}
+                                    else:
+                                        await db_session.rollback()
+                                        return {"success": False, "error": f"兑换码状态无效: {rc.status}"}
 
                             # 2. 锁定并校验 Team
                             stmt = select(Team).where(Team.id == team_id_final).with_for_update()
@@ -271,8 +333,11 @@ class RedeemFlowService:
                         
                         try:
                             # 重新载入，确保状态最新
-                            res = await db_session.execute(select(RedemptionCode).where(RedemptionCode.code == code).with_for_update())
-                            rc = res.scalar_one_or_none()
+                            if not is_super_code:
+                                res = await db_session.execute(select(RedemptionCode).where(RedemptionCode.code == code).with_for_update())
+                                rc = res.scalar_one_or_none()
+                            else:
+                                rc = None
                             res = await db_session.execute(select(Team).where(Team.id == team_id_final).with_for_update())
                             target_team = res.scalar_one_or_none()
 
@@ -295,20 +360,26 @@ class RedeemFlowService:
                                 raise Exception("Team账号受限: 官方拦截下发(响应空列表)，请检查账单/风控状态")
 
                             # 成功逻辑
-                            rc.status = "used"
-                            rc.used_by_email = email
-                            rc.used_team_id = team_id_final
-                            rc.used_at = get_now()
-                            if rc.has_warranty:
-                                days = rc.warranty_days or 30
-                                rc.warranty_expires_at = get_now() + timedelta(days=days)
+                            if is_super_code:
+                                await self._ensure_super_code_record(code, db_session)
+                                is_warranty_redemption = True
+                                logger.info(f"记录特权兑换码使用: {email} -> Team {team_id_final}")
+                            else:
+                                rc.status = "used"
+                                rc.used_by_email = email
+                                rc.used_team_id = team_id_final
+                                rc.used_at = get_now()
+                                if rc.has_warranty:
+                                    days = rc.warranty_days or 30
+                                    rc.warranty_expires_at = get_now() + timedelta(days=days)
+                                is_warranty_redemption = rc.has_warranty
 
                             record = RedemptionRecord(
                                 email=email,
                                 code=code,
                                 team_id=team_id_final,
                                 account_id=target_team.account_id,
-                                is_warranty_redemption=rc.has_warranty
+                                is_warranty_redemption=is_warranty_redemption
                             )
                             db_session.add(record)
                             target_team.current_members += 1

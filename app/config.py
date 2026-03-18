@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     # 时区配置
     timezone: str = "Asia/Shanghai"
 
+    # 特权兑换码配置（默认关闭）
+    super_redeem_code_enabled: bool = False
+    super_redeem_code: str = ""
+
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env",
         env_file_encoding="utf-8",
