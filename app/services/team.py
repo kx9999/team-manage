@@ -10,6 +10,7 @@ from sqlalchemy import select, update, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.database import AsyncSessionLocal
 from app.models import Team, TeamAccount, RedemptionCode
 from app.services.chatgpt import ChatGPTService
 from app.services.encryption import encryption_service
@@ -29,6 +30,21 @@ class TeamService:
         self.chatgpt_service = chatgpt_service
         self.token_parser = TokenParser()
         self.jwt_parser = JWTParser()
+
+    async def _persist_team_status_independent(self, team_id: int, status_value: str) -> bool:
+        """
+        使用独立会话持久化 Team 状态，避免被外层事务回滚影响
+        """
+        try:
+            async with AsyncSessionLocal() as isolated_session:
+                await isolated_session.execute(
+                    update(Team).where(Team.id == team_id).values(status=status_value)
+                )
+                await isolated_session.commit()
+            return True
+        except Exception as e:
+            logger.error(f"独立事务落库 Team 状态失败: team_id={team_id}, status={status_value}, error={e}")
+            return False
 
     async def _handle_api_error(self, result: Dict[str, Any], team: Team, db_session: AsyncSession) -> bool:
         """
@@ -89,7 +105,8 @@ class TeamService:
                 
             logger.warning(f"检测到账号{status_desc} (code={error_code}, msg={error_msg}), 更新 Team {team.id} ({team.email}) 状态为 banned")
             team.status = "banned"
-            if not db_session.in_transaction():
+            persisted = await self._persist_team_status_independent(team.id, "banned")
+            if not persisted and not db_session.in_transaction():
                 await db_session.commit()
             return True
 

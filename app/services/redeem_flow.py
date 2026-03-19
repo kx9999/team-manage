@@ -6,7 +6,7 @@ import logging
 import asyncio
 import traceback
 from collections import defaultdict
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 from datetime import datetime, timedelta
 from sqlalchemy import select, update, delete, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -232,6 +232,7 @@ class RedeemFlowService:
         last_error = "未知错误"
         max_retries = 3
         current_target_team_id = team_id
+        excluded_team_ids: Set[int] = set()
         core_success = False
         success_result = None
         team_id_final = None
@@ -246,7 +247,10 @@ class RedeemFlowService:
                     # 确定目标 Team (初选)
                     team_id_final = current_target_team_id
                     if not team_id_final:
-                        select_res = await self.select_team_auto(db_session)
+                        select_res = await self.select_team_auto(
+                            db_session,
+                            exclude_team_ids=list(excluded_team_ids) if excluded_team_ids else None
+                        )
                         if not select_res["success"]:
                             return {"success": False, "error": select_res["error"]}
                         team_id_final = select_res["team_id"]
@@ -427,6 +431,8 @@ class RedeemFlowService:
                     if any(kw in last_error.lower() for kw in ["已满", "seats", "full"]):
                         try:
                             if not team_id:
+                                if team_id_final:
+                                    excluded_team_ids.add(team_id_final)
                                 from sqlalchemy import update as sqlalchemy_update
                                 await db_session.execute(
                                     sqlalchemy_update(Team).where(Team.id == team_id_final).values(status="full")
@@ -435,6 +441,20 @@ class RedeemFlowService:
                             current_target_team_id = None
                         except:
                             pass
+
+                    # 自动选队模式下，遇到 Team 不可用/封禁/失效时，下一次重试切换 Team
+                    error_lower = last_error.lower()
+                    is_team_unavailable = (
+                        any(kw in error_lower for kw in ["banned", "token_invalidated"])
+                        or any(kw in last_error for kw in ["不可用", "封禁", "失效", "访问权限失败"])
+                    )
+                    if not team_id and is_team_unavailable:
+                        if team_id_final:
+                            excluded_team_ids.add(team_id_final)
+                        current_target_team_id = None
+                        logger.warning(
+                            f"Team {team_id_final} 标记为本次兑换重试排除对象，下一次将尝试切换其他 Team"
+                        )
                     
                     if attempt < max_retries - 1:
                         await asyncio.sleep(1.5 * (attempt + 1))
